@@ -1,0 +1,5 @@
+comment = 'TreeDB table access method (Phase 0 prototype)'
+default_version = '1.0'
+module_pathname = '$libdir/treedb_pgext'
+relocatable = false
+superuser = true
