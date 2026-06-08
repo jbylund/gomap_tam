@@ -3,13 +3,14 @@
 
 #include <stdint.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include <sched.h>   /* sched_yield() */
 
 #include "postgres.h"
 #include "miscadmin.h"   /* DataDir */
 #include "storage/pg_shmem.h"
+
+/* iceoryx2 C bindings */
+#include "iox2/iceoryx2.h"
 
 /* ----------------------------------------------------------------
  * Protocol constants (must match treedb_shim.go)
@@ -30,18 +31,18 @@
 #define TDB_STATUS_NOT_FOUND 0x01
 #define TDB_STATUS_ERROR     0x02
 
-/* Maximum payload we'll ever send in a single RPC (8 KB for one tuple). */
+/* Maximum tuple size in a single RPC. */
 #define TDB_MAX_TUPLE_BYTES  (8 * 1024)
 
-/* ----------------------------------------------------------------
- * Socket path helpers
- * ---------------------------------------------------------------- */
-static inline void
-tdb_socket_path(char *buf, size_t bufsz)
-{
-    snprintf(buf, bufsz, "%s/treedb.sock", DataDir);
-}
+/* iceoryx2 service name — must match treedb_bgworker.c */
+#define TDB_SERVICE_NAME     "treedb/bgworker"
 
+/* Initial max slice length hint for the client (u8 elements). */
+#define TDB_CLIENT_MAX_SLICE  (8 * 1024 + 64)
+
+/* ----------------------------------------------------------------
+ * Path helpers
+ * ---------------------------------------------------------------- */
 static inline void
 tdb_db_path(char *buf, size_t bufsz)
 {
@@ -49,108 +50,108 @@ tdb_db_path(char *buf, size_t bufsz)
 }
 
 /* ----------------------------------------------------------------
- * Persistent per-process connection to the background worker.
+ * Per-process iceoryx2 client state.
  *
- * Each backend holds a single open Unix socket that is reused across
- * all RPCs.  tdb_conn_reset() closes and invalidates it; the next
- * tdb_rpc() call will reconnect automatically.  The OS closes the fd
- * when the backend process exits.
+ * Each backend gets its own iceoryx2 node and client, initialised
+ * lazily on the first tdb_rpc() call and reused thereafter.
  * ---------------------------------------------------------------- */
-static int tdb_conn_fd = -1;
+static iox2_node_h  tdb_iox2_node   = NULL;
+static iox2_client_h tdb_iox2_client = NULL;
 
 static inline void
-tdb_conn_reset(void)
+tdb_iox2_reset(void)
 {
-    if (tdb_conn_fd >= 0)
+    if (tdb_iox2_client != NULL)
     {
-        close(tdb_conn_fd);
-        tdb_conn_fd = -1;
+        iox2_client_drop(tdb_iox2_client);
+        tdb_iox2_client = NULL;
+    }
+    if (tdb_iox2_node != NULL)
+    {
+        iox2_node_drop(tdb_iox2_node);
+        tdb_iox2_node = NULL;
     }
 }
 
-/* ----------------------------------------------------------------
- * Low-level I/O helpers
- * ---------------------------------------------------------------- */
+/* Connect to the iceoryx2 service, retrying for up to 10 s
+ * while the background worker is starting up. */
 static inline void
-tdb_write_all(int fd, const void *buf, int len)
+tdb_iox2_connect(void)
 {
-    const char *ptr = (const char *) buf;
-    while (len > 0)
-    {
-        int n = (int) send(fd, ptr, len, 0);
-        if (n <= 0)
-        {
-            tdb_conn_reset(); /* mark broken; next RPC will reconnect */
-            ereport(ERROR, (errmsg("treedb: send failed: %m")));
-        }
-        ptr += n;
-        len -= n;
-    }
-}
+    iox2_node_builder_h                      nb          = NULL;
+    iox2_service_name_h                      svc_name    = NULL;
+    iox2_service_builder_h                   svc_builder = NULL;
+    iox2_service_builder_request_response_h  sb_rr;
+    iox2_port_factory_request_response_h     service     = NULL;
+    iox2_port_factory_client_builder_h       cli_builder = NULL;
+    int  ret;
+    int  retries = 100; /* 100 × 100 ms = 10 s */
 
-static inline void
-tdb_read_all(int fd, void *buf, int len)
-{
-    char *ptr = (char *) buf;
-    while (len > 0)
-    {
-        int n = (int) recv(fd, ptr, len, 0);
-        if (n <= 0)
-        {
-            tdb_conn_reset(); /* mark broken; next RPC will reconnect */
-            ereport(ERROR, (errmsg("treedb: recv failed: %m")));
-        }
-        ptr += n;
-        len -= n;
-    }
-}
+    iox2_set_log_level_from_env_or(iox2_log_level_e_WARN);
 
-/* Open a fresh connection with retry (up to 10 s for bgworker startup). */
-static inline int
-tdb_connect(void)
-{
-    char        sockpath[MAXPGPATH];
-    struct sockaddr_un addr;
-    int         fd;
-    int         retries = 100; /* 100 × 100 ms = 10 s */
+    nb = iox2_node_builder_new(NULL);
+    ret = iox2_node_builder_create(nb, NULL, iox2_service_type_e_IPC, &tdb_iox2_node);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: iox2_node_builder_create failed: %d", ret)));
 
-    tdb_socket_path(sockpath, sizeof(sockpath));
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, sockpath, sizeof(addr.sun_path));
+    ret = iox2_service_name_new(NULL, TDB_SERVICE_NAME,
+                                strlen(TDB_SERVICE_NAME), &svc_name);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: iox2_service_name_new failed: %d", ret)));
 
+    svc_builder = iox2_node_service_builder(&tdb_iox2_node, NULL,
+                                            iox2_cast_service_name_ptr(svc_name));
+    sb_rr = iox2_service_builder_request_response(svc_builder);
+
+    /* Must match the type details the background-worker server uses. */
+    iox2_service_builder_request_response_set_request_payload_type_details(
+            &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
+    iox2_service_builder_request_response_set_response_payload_type_details(
+            &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
+
+    /* Retry until the background worker has created the service. */
     while (retries-- > 0)
     {
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0)
-            ereport(ERROR, (errmsg("treedb: socket(): %m")));
-
-        if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0)
-            return fd;
-
-        close(fd);
+        ret = iox2_service_builder_request_response_open_or_create(sb_rr, NULL, &service);
+        if (ret == IOX2_OK)
+            break;
         pg_usleep(100000L); /* 100 ms */
     }
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: cannot connect to background worker service \"%s\"",
+                        TDB_SERVICE_NAME)));
 
-    ereport(ERROR,
-            (errmsg("treedb: cannot connect to background worker at %s",
-                    sockpath)));
-    return -1; /* not reached */
+    cli_builder = iox2_port_factory_request_response_client_builder(&service, NULL);
+    iox2_port_factory_client_builder_set_initial_max_slice_len(
+            &cli_builder, (c_size_t) TDB_CLIENT_MAX_SLICE);
+    iox2_port_factory_client_builder_set_allocation_strategy(
+            &cli_builder, iox2_allocation_strategy_e_POWER_OF_TWO);
+
+    ret = iox2_port_factory_client_builder_create(cli_builder, NULL, &tdb_iox2_client);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: client create failed: %d", ret)));
+
+    iox2_port_factory_request_response_drop(service);
+    iox2_service_name_drop(svc_name);
 }
 
-/* Return the persistent fd, connecting lazily on first call. */
-static inline int
-tdb_get_connection(void)
+static inline iox2_client_h *
+tdb_get_client(void)
 {
-    if (tdb_conn_fd < 0)
-        tdb_conn_fd = tdb_connect();
-    return tdb_conn_fd;
+    if (tdb_iox2_client == NULL)
+        tdb_iox2_connect();
+    return &tdb_iox2_client;
 }
 
 /* ----------------------------------------------------------------
- * Single RPC over the persistent connection.
+ * Single RPC over iceoryx2.
+ *
+ * Wire format (request slice):  [1 opcode][payload_len bytes payload]
+ * Wire format (response slice): [1 status][resp_len bytes response]
+ *
  * If resp_out != NULL, *resp_out is palloc'd; caller must pfree.
- * Raises ereport(ERROR) on I/O error or TDB_STATUS_ERROR.
+ * Raises ereport(ERROR) on transport error or TDB_STATUS_ERROR.
  * Returns TDB_STATUS_OK or TDB_STATUS_NOT_FOUND.
  * ---------------------------------------------------------------- */
 static inline uint8
@@ -158,56 +159,87 @@ tdb_rpc(uint8 opcode,
         const void *req, uint32 req_len,
         void **resp_out, uint32 *resp_len_out)
 {
-    int     fd = tdb_get_connection();
-    uint8   hdr[5];
-    uint8   resp_hdr[5];
-    uint8   status;
-    uint32  rlen;
+    iox2_client_h          *client      = tdb_get_client();
+    iox2_request_mut_h      request     = NULL;
+    iox2_pending_response_h pending     = NULL;
+    iox2_response_h         response    = NULL;
+    uint8_t                *req_payload = NULL;
+    c_size_t                total_req   = (c_size_t)(1 + req_len);
+    const uint8_t          *resp_data   = NULL;
+    c_size_t                resp_elems  = 0;
+    uint8                   status;
+    uint32                  rlen;
+    int                     ret;
 
-    /* Write request header + payload */
-    hdr[0] = opcode;
-    hdr[1] = (req_len >> 24) & 0xFF;
-    hdr[2] = (req_len >> 16) & 0xFF;
-    hdr[3] = (req_len >> 8)  & 0xFF;
-    hdr[4] =  req_len        & 0xFF;
-    tdb_write_all(fd, hdr, 5);
+    /* Loan shared-memory slice for the request. */
+    ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: loan request slice failed: %d", ret)));
+
+    iox2_request_mut_payload_mut(&request, (void **) &req_payload, NULL);
+    req_payload[0] = opcode;
     if (req_len > 0)
-        tdb_write_all(fd, req, (int) req_len);
+        memcpy(req_payload + 1, req, (size_t) req_len);
 
-    /* Read response header */
-    tdb_read_all(fd, resp_hdr, 5);
-    status = resp_hdr[0];
-    rlen   = ((uint32) resp_hdr[1] << 24) |
-             ((uint32) resp_hdr[2] << 16) |
-             ((uint32) resp_hdr[3] <<  8) |
-              (uint32) resp_hdr[4];
+    /* Send request. */
+    ret = iox2_request_mut_send(request, NULL, &pending);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: send request failed: %d", ret)));
 
-    /* Read response payload */
-    if (rlen > 0)
+    /* Wait for response (poll with a short sleep to avoid spinning a full core). */
+    while (true)
+    {
+        response = NULL;
+        ret = iox2_pending_response_receive(&pending, NULL, &response);
+        if (ret != IOX2_OK)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR,
+                    (errmsg("treedb: pending_response_receive failed: %d", ret)));
+        }
+        if (response != NULL)
+            break;
+        sched_yield(); /* yield without sleeping — macOS usleep(10) sleeps ~100µs */
+    }
+
+    iox2_pending_response_drop(pending);
+
+    /* Decode response: [1 status byte][resp bytes...] */
+    iox2_response_payload(&response, (const void **) &resp_data, &resp_elems);
+
+    status = (resp_elems >= 1) ? resp_data[0] : TDB_STATUS_ERROR;
+    rlen   = (resp_elems > 1)  ? (uint32)(resp_elems - 1) : 0;
+
+    if (status == TDB_STATUS_ERROR)
+    {
+        char errmsg_buf[256] = "unknown error from background worker";
+        if (rlen > 0)
+        {
+            uint32 msglen = rlen < sizeof(errmsg_buf) - 1
+                            ? rlen : (uint32)(sizeof(errmsg_buf) - 1);
+            memcpy(errmsg_buf, resp_data + 1, msglen);
+            errmsg_buf[msglen] = '\0';
+        }
+        iox2_response_drop(response);
+        ereport(ERROR, (errmsg("treedb: %s", errmsg_buf)));
+    }
+
+    if (rlen > 0 && resp_out != NULL)
     {
         void *buf = palloc(rlen);
-        tdb_read_all(fd, buf, (int) rlen);
-        if (resp_out)      *resp_out     = buf;
-        if (resp_len_out)  *resp_len_out = rlen;
-
-        if (status == TDB_STATUS_ERROR)
-        {
-            char errmsg_buf[256];
-            uint32 msglen = rlen < sizeof(errmsg_buf) - 1 ? rlen : sizeof(errmsg_buf) - 1;
-            memcpy(errmsg_buf, buf, msglen);
-            errmsg_buf[msglen] = '\0';
-            ereport(ERROR, (errmsg("treedb: %s", errmsg_buf)));
-        }
+        memcpy(buf, resp_data + 1, rlen);
+        *resp_out = buf;
+        if (resp_len_out) *resp_len_out = rlen;
     }
     else
     {
         if (resp_out)     *resp_out     = NULL;
         if (resp_len_out) *resp_len_out = 0;
-
-        if (status == TDB_STATUS_ERROR)
-            ereport(ERROR, (errmsg("treedb: unknown error from background worker")));
     }
 
+    iox2_response_drop(response);
     return status;
 }
 
@@ -270,7 +302,7 @@ tdb_seq_to_ctid(uint64 seq, ItemPointer tid)
 }
 
 /* ----------------------------------------------------------------
- * Convenience RPC wrappers used by both treedb_tam.c and treedb_bgworker.c
+ * Convenience RPC wrapper used by both treedb_tam.c and treedb_bgworker.c
  * ---------------------------------------------------------------- */
 static inline void
 tdb_truncate_rpc(RelFileNumber relnum)

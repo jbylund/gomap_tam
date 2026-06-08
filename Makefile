@@ -6,9 +6,18 @@ PKGLIBDIR   := $(shell $(PG_CONFIG) --pkglibdir)
 SHIM_DIR    := go
 SHIM_SO     := $(PKGLIBDIR)/treedb_shim.so
 
-# Pass the shim path as a compile-time constant so the background worker
-# knows where to dlopen it.
-PG_CPPFLAGS := -I$(CURDIR) -DTDB_SHIM_PATH=\"$(SHIM_SO)\"
+# iceoryx2-c paths (built in-tree from the cloned repo)
+IOX2_ROOT   := $(CURDIR)/../iceoryx2
+IOX2_BUILD  := $(IOX2_ROOT)/target/ff/cc/build/rust/native/release
+IOX2_INC    := $(IOX2_BUILD)/iceoryx2-ffi-c-cbindgen/include
+IOX2_LIB    := $(IOX2_BUILD)/libiceoryx2_ffi_c.a
+
+# Compiler flags: include iceoryx2 headers + pass shim path.
+PG_CPPFLAGS := -I$(CURDIR) -I$(IOX2_INC) -DTDB_SHIM_PATH=\"$(SHIM_SO)\"
+
+# Extra linker flags: link iceoryx2 static library.
+# -lm -ldl -lpthread are needed by the Rust runtime inside the static lib.
+SHLIB_LINK  := $(IOX2_LIB) -lm -ldl -lpthread
 
 MODULE_big  := treedb_pgext
 OBJS        := treedb_tam.o treedb_bgworker.o
@@ -18,9 +27,6 @@ DATA        := treedb_pgext--1.0.sql
 include $(PGXS)
 
 # Build the Go shared library before the C objects.
-# The Go toolchain generates treedb_shim.h automatically; we don't use it
-# (we load via dlopen at runtime), but we write it to /dev/null to keep the
-# build directory clean.
 $(SHIM_SO): $(SHIM_DIR)/treedb_shim.go $(SHIM_DIR)/go.mod
 	@echo "==> Building Go shim..."
 	cd $(SHIM_DIR) && \
@@ -28,7 +34,6 @@ $(SHIM_SO): $(SHIM_DIR)/treedb_shim.go $(SHIM_DIR)/go.mod
 	    -buildmode=c-shared \
 	    -o $(SHIM_SO) \
 	    .
-	@# The auto-generated header goes into /dev/null; we use dlopen, not static linking.
 	@test -f $(SHIM_DIR)/treedb_shim.h && mv $(SHIM_DIR)/treedb_shim.h /dev/null || true
 	@echo "==> Go shim installed to $(SHIM_SO)"
 

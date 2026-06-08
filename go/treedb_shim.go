@@ -9,12 +9,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	treedb "github.com/snissn/gomap/TreeDB"
 )
@@ -437,111 +436,88 @@ func handleTruncate(payload []byte) (byte, []byte) {
 	return statusOK, nil
 }
 
-// handleConn serves a persistent connection, processing RPCs until the client
-// closes the connection or an I/O error occurs.
-func handleConn(conn net.Conn) {
-	defer conn.Close()
-
-	for {
-		// Read: [1-byte opcode][4-byte payload_len BE][payload]
-		var hdr [5]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			return // EOF or error: client closed connection
-		}
-		opcode := hdr[0]
-		payloadLen := binary.BigEndian.Uint32(hdr[1:5])
-
-		payload := make([]byte, payloadLen)
-		if payloadLen > 0 {
-			if _, err := io.ReadFull(conn, payload); err != nil {
-				return
-			}
-		}
-
-		var respStatus byte
-		var respPayload []byte
-
-		switch opcode {
-		case opInsert:
-			respStatus, respPayload = handleInsert(payload)
-		case opScanBegin:
-			respStatus, respPayload = handleScanBegin(payload)
-		case opScanNext:
-			respStatus, respPayload = handleScanNext(payload)
-		case opScanEnd:
-			respStatus, respPayload = handleScanEnd(payload)
-		case opFetch:
-			respStatus, respPayload = handleFetch(payload)
-		case opDelete:
-			respStatus, respPayload = handleDelete(payload)
-		case opTruncate:
-			respStatus, respPayload = handleTruncate(payload)
-		case opCount:
-			respStatus, respPayload = handleCount(payload)
-		case opUpdate:
-			respStatus, respPayload = handleUpdate(payload)
-		case opInsertKeyed:
-			respStatus, respPayload = handleInsertKeyed(payload)
-		case opRekey:
-			respStatus, respPayload = handleRekey(payload)
-		default:
-			respStatus = statusError
-			respPayload = []byte("unknown opcode")
-		}
-
-		// Write: [1-byte status][4-byte payload_len BE][payload]
-		var respHdr [5]byte
-		respHdr[0] = respStatus
-		binary.BigEndian.PutUint32(respHdr[1:5], uint32(len(respPayload)))
-		if _, err := conn.Write(respHdr[:]); err != nil {
-			return
-		}
-		if len(respPayload) > 0 {
-			if _, err := conn.Write(respPayload); err != nil {
-				return
-			}
-		}
+// dispatch routes an opcode + payload to the appropriate handler.
+func dispatch(opcode byte, payload []byte) (byte, []byte) {
+	switch opcode {
+	case opInsert:
+		return handleInsert(payload)
+	case opScanBegin:
+		return handleScanBegin(payload)
+	case opScanNext:
+		return handleScanNext(payload)
+	case opScanEnd:
+		return handleScanEnd(payload)
+	case opFetch:
+		return handleFetch(payload)
+	case opDelete:
+		return handleDelete(payload)
+	case opTruncate:
+		return handleTruncate(payload)
+	case opCount:
+		return handleCount(payload)
+	case opUpdate:
+		return handleUpdate(payload)
+	case opInsertKeyed:
+		return handleInsertKeyed(payload)
+	case opRekey:
+		return handleRekey(payload)
+	default:
+		return statusError, []byte("unknown opcode")
 	}
 }
 
-// treedb_serve sets up the base data directory, listens on socketPath, and serves
-// requests until the process exits. Per-relation TreeDB instances are opened lazily
-// on first access. Called from the Postgres background worker via dlopen/dlsym.
+// treedb_init sets up the base data directory. Must be called once before
+// any treedb_handle calls. Called from the background worker after dlopen.
 //
-//export treedb_serve
-func treedb_serve(socketPathC *C.char, dbPathC *C.char) {
-	socketPath := C.GoString(socketPathC)
+//export treedb_init
+func treedb_init(dbPathC *C.char) C.int32_t {
 	baseDBPath = C.GoString(dbPathC)
-
-	os.Remove(socketPath)
-
 	if err := os.MkdirAll(baseDBPath, 0755); err != nil {
-		os.Stderr.WriteString("treedb_serve: mkdir failed: " + err.Error() + "\n")
-		os.Exit(1)
+		os.Stderr.WriteString("treedb_init: mkdir failed: " + err.Error() + "\n")
+		return C.int32_t(-1)
+	}
+	return C.int32_t(0)
+}
+
+// treedb_handle processes one RPC request and writes the response into respBuf.
+//
+// opcode:       operation code (TDB_OP_*)
+// req:          request payload bytes (after opcode)
+// reqLen:       length of req
+// respBuf:      caller-allocated output buffer
+// respBufSize:  size of respBuf
+// respLenOut:   receives the number of bytes written into respBuf
+//
+// Returns the status byte (TDB_STATUS_*).
+//
+//export treedb_handle
+func treedb_handle(
+	opcode C.uint8_t,
+	req *C.uint8_t,
+	reqLen C.uint32_t,
+	respBuf *C.uint8_t,
+	respBufSize C.uint32_t,
+	respLenOut *C.uint32_t,
+) C.uint8_t {
+	var payload []byte
+	if reqLen > 0 {
+		payload = (*[1 << 30]byte)(unsafe.Pointer(req))[:int(reqLen):int(reqLen)]
 	}
 
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		os.Stderr.WriteString("treedb_serve: listen failed: " + err.Error() + "\n")
-		os.Exit(1)
-	}
+	status, respPayload := dispatch(byte(opcode), payload)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			break // socket closed (process shutting down)
+	if respLenOut != nil {
+		*respLenOut = 0
+	}
+	if len(respPayload) > 0 && respBuf != nil && respBufSize > 0 {
+		dst := (*[1 << 30]byte)(unsafe.Pointer(respBuf))[:int(respBufSize):int(respBufSize)]
+		n := copy(dst, respPayload)
+		if respLenOut != nil {
+			*respLenOut = C.uint32_t(n)
 		}
-		go handleConn(conn)
 	}
 
-	// Close all open relation DBs on shutdown.
-	dbMapMu.Lock()
-	for _, db := range dbMap {
-		db.Close()
-	}
-	dbMapMu.Unlock()
-
-	os.Remove(socketPath)
+	return C.uint8_t(status)
 }
 
 func main() {}
