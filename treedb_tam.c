@@ -39,6 +39,8 @@ typedef struct TDBScanDesc
     uint8              *batch_buf;      /* palloc'd, TDB_SCAN_RESP_BUF bytes */
     uint32              batch_nrows;    /* rows remaining in buffer */
     uint32              batch_pos;      /* byte offset of next row in batch_buf */
+    /* Reused tuple header — t_data points into batch_buf; no palloc per row */
+    HeapTupleData       current_tuple;
 } TDBScanDesc;
 
 /* ----------------------------------------------------------------
@@ -129,8 +131,6 @@ tdb_scan_next_batch(TDBScanDesc *scan, Oid tableOid, TupleTableSlot *slot)
     uint32          nrows;
     uint64          seq_num;
     uint32          tuple_len;
-    ItemPointerData tid;
-    HeapTuple       tuple;
     uint8          *p;
 
     /* Refill when buffer is drained. */
@@ -155,18 +155,22 @@ tdb_scan_next_batch(TDBScanDesc *scan, Oid tableOid, TupleTableSlot *slot)
         scan->batch_pos   = 4; /* skip the leading num_rows field */
     }
 
-    /* Consume one row from the buffer. */
+    /* Consume one row from the buffer — point t_data directly into batch_buf,
+     * no palloc+memcpy.  The slot is valid only until the next getnextslot call,
+     * and batch_buf lives for the scan's lifetime, so this is safe. */
     p         = scan->batch_buf + scan->batch_pos;
     seq_num   = tdb_get_u64(p);      p += 8;
     tuple_len = tdb_get_u32(p);      p += 4;
 
-    tdb_seq_to_ctid(seq_num, &tid);
-    tuple = tdb_make_tuple(tableOid, &tid, (char *) p, tuple_len);
+    tdb_seq_to_ctid(seq_num, &scan->current_tuple.t_self);
+    scan->current_tuple.t_len     = tuple_len;
+    scan->current_tuple.t_tableOid = tableOid;
+    scan->current_tuple.t_data    = (HeapTupleHeader) p;
 
     scan->batch_pos   = (uint32)(p + tuple_len - scan->batch_buf);
     scan->batch_nrows--;
 
-    ExecStoreHeapTuple(tuple, slot, true);
+    ExecStoreHeapTuple(&scan->current_tuple, slot, false);
     return true;
 }
 
