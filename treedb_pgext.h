@@ -34,8 +34,25 @@
 /* Maximum tuple size in a single RPC. */
 #define TDB_MAX_TUPLE_BYTES  (8 * 1024)
 
-/* iceoryx2 service name — must match treedb_bgworker.c */
-#define TDB_SERVICE_NAME     "treedb/bgworker"
+/*
+ * CPU pause hint for spin-wait loops.
+ * ARM yield / x86 PAUSE: ~5 ns each, avoids pipeline stalls and excess power.
+ * 2048 iterations ≈ 10 µs max spin before falling back to sched_yield.
+ */
+#if defined(__aarch64__)
+#  define TDB_CPU_PAUSE()  __asm__ volatile("yield" ::: "memory")
+#elif defined(__x86_64__)
+#  define TDB_CPU_PAUSE()  __asm__ volatile("pause" ::: "memory")
+#else
+#  define TDB_CPU_PAUSE()  ((void)0)
+#endif
+/* 2048 measured at ~7,630 TPS; doubling to 4096 dropped to ~7,411 TPS —
+ * 2048 is near the sweet spot where almost all responses arrive in phase 1. */
+#define TDB_SPIN_ITERS  2048
+
+/* iceoryx2 service names — must match treedb_bgworker.c */
+#define TDB_SERVICE_NAME       "treedb/bgworker"
+#define TDB_EVENT_SERVICE_NAME "treedb/bgworker/event"
 
 /* Initial max slice length hint for the client (u8 elements). */
 #define TDB_CLIENT_MAX_SLICE  (8 * 1024 + 64)
@@ -55,12 +72,18 @@ tdb_db_path(char *buf, size_t bufsz)
  * Each backend gets its own iceoryx2 node and client, initialised
  * lazily on the first tdb_rpc() call and reused thereafter.
  * ---------------------------------------------------------------- */
-static iox2_node_h  tdb_iox2_node   = NULL;
-static iox2_client_h tdb_iox2_client = NULL;
+static iox2_node_h     tdb_iox2_node     = NULL;
+static iox2_client_h   tdb_iox2_client   = NULL;
+static iox2_notifier_h tdb_iox2_notifier = NULL;
 
 static inline void
 tdb_iox2_reset(void)
 {
+    if (tdb_iox2_notifier != NULL)
+    {
+        iox2_notifier_drop(tdb_iox2_notifier);
+        tdb_iox2_notifier = NULL;
+    }
     if (tdb_iox2_client != NULL)
     {
         iox2_client_drop(tdb_iox2_client);
@@ -78,12 +101,17 @@ tdb_iox2_reset(void)
 static inline void
 tdb_iox2_connect(void)
 {
-    iox2_node_builder_h                      nb          = NULL;
-    iox2_service_name_h                      svc_name    = NULL;
-    iox2_service_builder_h                   svc_builder = NULL;
+    iox2_node_builder_h                      nb           = NULL;
+    iox2_service_name_h                      svc_name     = NULL;
+    iox2_service_builder_h                   svc_builder  = NULL;
     iox2_service_builder_request_response_h  sb_rr;
-    iox2_port_factory_request_response_h     service     = NULL;
-    iox2_port_factory_client_builder_h       cli_builder = NULL;
+    iox2_port_factory_request_response_h     service      = NULL;
+    iox2_port_factory_client_builder_h       cli_builder  = NULL;
+    iox2_service_name_h                      evt_svc_name = NULL;
+    iox2_service_builder_h                   evt_svc_bldr = NULL;
+    iox2_service_builder_event_h             evt_sb;
+    iox2_port_factory_event_h                evt_factory  = NULL;
+    iox2_port_factory_notifier_builder_h     ntf_builder  = NULL;
     int  ret;
     int  retries = 100; /* 100 × 100 ms = 10 s */
 
@@ -103,13 +131,14 @@ tdb_iox2_connect(void)
                                             iox2_cast_service_name_ptr(svc_name));
     sb_rr = iox2_service_builder_request_response(svc_builder);
 
-    /* Must match the type details the background-worker server uses. */
     iox2_service_builder_request_response_set_request_payload_type_details(
             &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
     iox2_service_builder_request_response_set_response_payload_type_details(
             &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
 
-    /* Retry until the background worker has created the service. */
+    /* Retry until the background worker has created the rr service.
+     * The event service is created first by the bgworker, so once rr is
+     * available the event service is guaranteed to exist too. */
     while (retries-- > 0)
     {
         ret = iox2_service_builder_request_response_open_or_create(sb_rr, NULL, &service);
@@ -134,6 +163,27 @@ tdb_iox2_connect(void)
 
     iox2_port_factory_request_response_drop(service);
     iox2_service_name_drop(svc_name);
+
+    /* --- Set up notifier on the event service --- */
+    ret = iox2_service_name_new(NULL, TDB_EVENT_SERVICE_NAME,
+                                strlen(TDB_EVENT_SERVICE_NAME), &evt_svc_name);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: event service_name_new failed: %d", ret)));
+
+    evt_svc_bldr = iox2_node_service_builder(&tdb_iox2_node, NULL,
+                                             iox2_cast_service_name_ptr(evt_svc_name));
+    evt_sb = iox2_service_builder_event(evt_svc_bldr);
+    ret = iox2_service_builder_event_open_or_create(evt_sb, NULL, &evt_factory);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: event service open failed: %d", ret)));
+
+    ntf_builder = iox2_port_factory_event_notifier_builder(&evt_factory, NULL);
+    ret = iox2_port_factory_notifier_builder_create(ntf_builder, NULL, &tdb_iox2_notifier);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: notifier create failed: %d", ret)));
+
+    iox2_port_factory_event_drop(evt_factory);
+    iox2_service_name_drop(evt_svc_name);
 }
 
 static inline iox2_client_h *
@@ -170,6 +220,7 @@ tdb_rpc(uint8 opcode,
     uint8                   status;
     uint32                  rlen;
     int                     ret;
+    int                     spin;
 
     /* Loan shared-memory slice for the request. */
     ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
@@ -182,14 +233,22 @@ tdb_rpc(uint8 opcode,
     if (req_len > 0)
         memcpy(req_payload + 1, req, (size_t) req_len);
 
-    /* Send request. */
+    /* Send request, then notify the server's WaitSet to wake it immediately. */
     ret = iox2_request_mut_send(request, NULL, &pending);
     if (ret != IOX2_OK)
         ereport(ERROR,
                 (errmsg("treedb: send request failed: %d", ret)));
 
-    /* Wait for response (poll with a short sleep to avoid spinning a full core). */
-    while (true)
+    iox2_notifier_notify(&tdb_iox2_notifier, NULL);
+
+    /* Wait for response.
+     *
+     * Phase 1: spin with CPU hint (~5 ns/iter) for up to TDB_SPIN_ITERS
+     * iterations.  The server typically responds in ~6–8 µs (kqueue wake +
+     * CGO + TreeDB op), so most responses are caught here without any syscall.
+     *
+     * Phase 2: fall back to sched_yield() for slow/rare cases. */
+    for (spin = 0; spin < TDB_SPIN_ITERS; spin++)
     {
         response = NULL;
         ret = iox2_pending_response_receive(&pending, NULL, &response);
@@ -201,7 +260,20 @@ tdb_rpc(uint8 opcode,
         }
         if (response != NULL)
             break;
-        sched_yield(); /* yield without sleeping — macOS usleep(10) sleeps ~100µs */
+        TDB_CPU_PAUSE();
+    }
+    while (response == NULL)
+    {
+        ret = iox2_pending_response_receive(&pending, NULL, &response);
+        if (ret != IOX2_OK)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR,
+                    (errmsg("treedb: pending_response_receive failed: %d", ret)));
+        }
+        if (response != NULL)
+            break;
+        sched_yield();
     }
 
     iox2_pending_response_drop(pending);

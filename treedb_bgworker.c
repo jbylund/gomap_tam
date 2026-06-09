@@ -20,7 +20,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <signal.h>
-#include <sched.h>    /* sched_yield() */
 
 /* iceoryx2 C bindings */
 #include "iox2/iceoryx2.h"
@@ -45,8 +44,9 @@ PGDLLEXPORT void treedb_bgworker_main(Datum main_arg);
 /* Maximum iceoryx2 response slice: 1 byte status + TDB_MAX_RESP_PAYLOAD. */
 #define TDB_MAX_RESP_SLICE    (TDB_MAX_RESP_PAYLOAD + 1)
 
-/* iceoryx2 service name — must match what the backends use. */
-#define TDB_SERVICE_NAME      "treedb/bgworker"
+/* iceoryx2 service names — must match treedb_pgext.h */
+#define TDB_SERVICE_NAME       "treedb/bgworker"
+#define TDB_EVENT_SERVICE_NAME "treedb/bgworker/event"
 
 typedef int32_t (*treedb_init_fn)(const char *db_path);
 typedef uint8_t (*treedb_handle_fn)(uint8_t opcode,
@@ -62,6 +62,97 @@ tdb_sigterm_handler(SIGNAL_ARGS)
     int save_errno = errno;
     tdb_got_sigterm = 1;
     errno = save_errno;
+}
+
+/* Context threaded through the WaitSet callback. */
+typedef struct
+{
+    iox2_server_h    *server;
+    treedb_handle_fn  handle_fn;
+    uint8_t          *resp_buf;
+    uint32_t          resp_buf_size;
+} tdb_bgworker_ctx_t;
+
+/*
+ * tdb_process_requests_cb — WaitSet callback.
+ *
+ * Called by iox2_waitset_wait_and_process_once_with_timeout whenever the
+ * listener fires (i.e. a backend sent a notify after writing its request).
+ * Drains all pending requests in a tight loop, dispatches each to the Go
+ * shim, and sends the response.  Returns CONTINUE so the WaitSet keeps
+ * running; the outer while-loop is responsible for checking SIGTERM.
+ */
+static iox2_callback_progression_e
+tdb_process_requests_cb(iox2_waitset_attachment_id_h attachment_id,
+                        iox2_callback_context ctx)
+{
+    tdb_bgworker_ctx_t   *wctx;
+    iox2_active_request_h active_req;
+    iox2_response_mut_h   response;
+    const uint8_t        *req_data;
+    c_size_t              req_elems;
+    uint8_t              *resp_payload;
+    uint8_t               opcode;
+    const uint8_t        *payload;
+    uint32_t              payload_len;
+    uint8_t               status;
+    uint32_t              resp_len;
+    c_size_t              total_resp;
+    int                   ret;
+
+    (void) attachment_id; /* single attachment — no need to check which */
+
+    wctx = (tdb_bgworker_ctx_t *) ctx;
+
+    while (true)
+    {
+        active_req = NULL;
+        ret = iox2_server_receive(wctx->server, NULL, &active_req);
+        if (ret != IOX2_OK || active_req == NULL)
+            break;
+
+        req_data  = NULL;
+        req_elems = 0;
+        iox2_active_request_payload(&active_req,
+                                    (const void **) &req_data, &req_elems);
+
+        if (req_elems < 1)
+        {
+            iox2_active_request_drop(active_req);
+            continue;
+        }
+
+        opcode      = req_data[0];
+        payload     = req_data + 1;
+        payload_len = (uint32_t)(req_elems - 1);
+
+        resp_len = 0;
+        status = wctx->handle_fn(opcode, payload, payload_len,
+                                  wctx->resp_buf, wctx->resp_buf_size, &resp_len);
+
+        total_resp   = (c_size_t)(1 + resp_len);
+        response     = NULL;
+        resp_payload = NULL;
+        ret = iox2_active_request_loan_slice_uninit(
+                &active_req, NULL, &response, total_resp);
+        if (ret != IOX2_OK)
+        {
+            ereport(WARNING,
+                    (errmsg("treedb: loan response slice failed: %d", ret)));
+            iox2_active_request_drop(active_req);
+            continue;
+        }
+
+        iox2_response_mut_payload_mut(&response, (void **) &resp_payload, NULL);
+        resp_payload[0] = status;
+        if (resp_len > 0)
+            memcpy(resp_payload + 1, wctx->resp_buf, resp_len);
+
+        iox2_response_mut_send(response);
+        iox2_active_request_drop(active_req);
+    }
+
+    return iox2_callback_progression_e_CONTINUE;
 }
 
 /* ----------------------------------------------------------------
@@ -191,20 +282,33 @@ treedb_bgworker_main(Datum main_arg)
     treedb_handle_fn    handle_fn;
     char                db_path[MAXPGPATH];
 
-    /* iceoryx2 handles */
-    iox2_node_builder_h              node_builder   = NULL;
-    iox2_node_h                      node_handle    = NULL;
-    iox2_service_name_h              svc_name       = NULL;
-    iox2_service_builder_h           svc_builder    = NULL;
-    iox2_service_builder_request_response_h sb_rr;
-    iox2_port_factory_request_response_h    service = NULL;
-    iox2_port_factory_server_builder_h      srv_builder = NULL;
-    iox2_server_h                    server         = NULL;
-    iox2_active_request_h            active_req     = NULL;
+    /* iceoryx2 request/response handles */
+    iox2_node_builder_h                      node_builder = NULL;
+    iox2_node_h                              node_handle  = NULL;
+    iox2_service_name_h                      svc_name     = NULL;
+    iox2_service_builder_h                   svc_builder  = NULL;
+    iox2_service_builder_request_response_h  sb_rr;
+    iox2_port_factory_request_response_h     service      = NULL;
+    iox2_port_factory_server_builder_h       srv_builder  = NULL;
+    iox2_server_h                            server       = NULL;
+
+    /* iceoryx2 event service handles (notifier + WaitSet wake-up) */
+    iox2_service_name_h                      evt_svc_name = NULL;
+    iox2_service_builder_h                   evt_svc_bldr = NULL;
+    iox2_service_builder_event_h             evt_sb;
+    iox2_port_factory_event_h                evt_factory  = NULL;
+    iox2_port_factory_listener_builder_h     lst_builder  = NULL;
+    iox2_listener_h                          listener     = NULL;
+    iox2_waitset_builder_h                   ws_builder   = NULL;
+    iox2_waitset_h                           waitset      = NULL;
+    iox2_waitset_guard_h                     guard        = NULL;
+    iox2_file_descriptor_ptr                 listener_fd;
+
+    tdb_bgworker_ctx_t       wctx;
+    iox2_waitset_run_result_e ws_result;
 
     /* Response scratch buffer (allocated on stack — 8 KB + overhead). */
-    uint8_t resp_buf[TDB_MAX_RESP_PAYLOAD];
-    uint32_t resp_len;
+    uint8_t  resp_buf[TDB_MAX_RESP_PAYLOAD];
 
     int ret;
 
@@ -239,7 +343,7 @@ treedb_bgworker_main(Datum main_arg)
         ereport(ERROR,
                 (errmsg("treedb: treedb_init(\"%s\") failed", db_path)));
 
-    /* --- Set up iceoryx2 --- */
+    /* --- Set up iceoryx2 node --- */
     iox2_set_log_level_from_env_or(iox2_log_level_e_WARN);
 
     node_builder = iox2_node_builder_new(NULL);
@@ -249,6 +353,56 @@ treedb_bgworker_main(Datum main_arg)
         ereport(ERROR,
                 (errmsg("treedb: iox2_node_builder_create failed: %d", ret)));
 
+    /* --- Set up event service (listener + WaitSet) ---
+     *
+     * Created BEFORE the request/response service so that by the time a
+     * client successfully opens the rr service, the event service already
+     * exists and the client can open it without retrying.
+     */
+    ret = iox2_service_name_new(NULL, TDB_EVENT_SERVICE_NAME,
+                                strlen(TDB_EVENT_SERVICE_NAME), &evt_svc_name);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: event service_name_new failed: %d", ret)));
+
+    evt_svc_bldr = iox2_node_service_builder(&node_handle, NULL,
+                                             iox2_cast_service_name_ptr(evt_svc_name));
+    evt_sb = iox2_service_builder_event(evt_svc_bldr);
+    /* Allow up to 64 concurrent backend notifiers; only 1 listener (us). */
+    iox2_service_builder_event_set_max_notifiers(&evt_sb, 64);
+    iox2_service_builder_event_set_max_listeners(&evt_sb, 1);
+    ret = iox2_service_builder_event_open_or_create(evt_sb, NULL, &evt_factory);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: event service open_or_create failed: %d", ret)));
+
+    lst_builder = iox2_port_factory_event_listener_builder(&evt_factory, NULL);
+    ret = iox2_port_factory_listener_builder_create(lst_builder, NULL, &listener);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: listener create failed: %d", ret)));
+
+    listener_fd = iox2_listener_get_file_descriptor(&listener);
+
+    iox2_waitset_builder_new(NULL, &ws_builder);
+    /* Disable iceoryx2 signal handling — we manage SIGTERM ourselves. */
+    iox2_waitset_builder_set_signal_handling_mode(&ws_builder,
+                                                  iox2_signal_handling_mode_e_DISABLED);
+    ret = iox2_waitset_builder_create(ws_builder, iox2_service_type_e_IPC,
+                                      NULL, &waitset);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: waitset create failed: %d", ret)));
+
+    ret = iox2_waitset_attach_notification(&waitset, listener_fd, NULL, &guard);
+    if (ret != IOX2_OK)
+        ereport(ERROR,
+                (errmsg("treedb: waitset attach_notification failed: %d", ret)));
+
+    iox2_port_factory_event_drop(evt_factory);
+    iox2_service_name_drop(evt_svc_name);
+
+    /* --- Set up request/response service --- */
     ret = iox2_service_name_new(NULL, TDB_SERVICE_NAME,
                                 strlen(TDB_SERVICE_NAME), &svc_name);
     if (ret != IOX2_OK)
@@ -259,14 +413,12 @@ treedb_bgworker_main(Datum main_arg)
                                             iox2_cast_service_name_ptr(svc_name));
     sb_rr = iox2_service_builder_request_response(svc_builder);
 
-    /* Request payload: dynamic [u8] slice (element size 1, alignment 1). */
     ret = iox2_service_builder_request_response_set_request_payload_type_details(
             &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
     if (ret != IOX2_OK)
         ereport(ERROR,
                 (errmsg("treedb: set request type details failed: %d", ret)));
 
-    /* Response payload: dynamic [u8] slice. */
     ret = iox2_service_builder_request_response_set_response_payload_type_details(
             &sb_rr, iox2_type_variant_e_DYNAMIC, "u8", 2, 1, 1);
     if (ret != IOX2_OK)
@@ -279,8 +431,6 @@ treedb_bgworker_main(Datum main_arg)
                 (errmsg("treedb: open_or_create service failed: %d", ret)));
 
     srv_builder = iox2_port_factory_request_response_server_builder(&service, NULL);
-
-    /* Pre-allocate enough shared memory for the largest possible response. */
     iox2_port_factory_server_builder_set_initial_max_slice_len(
             &srv_builder, (c_size_t) TDB_MAX_RESP_SLICE);
 
@@ -298,94 +448,33 @@ treedb_bgworker_main(Datum main_arg)
 
     /* --- Main event loop ---
      *
-     * iceoryx2 request/response does not expose a file descriptor for event-
-     * driven wake-up via WaitSet in the C API; polling is the only option.
-     * We drain all queued requests in a tight inner loop and sleep 10 µs when
-     * there is nothing to do.  At typical OLTP load the server is always busy
-     * so the sleep rarely fires; at idle it yields to the OS ~100 K times/s —
-     * far from pinning a core.
+     * iox2_waitset_wait_and_process_once_with_timeout blocks on the listener's
+     * file descriptor (kqueue on macOS, epoll on Linux) until a backend fires
+     * iox2_notifier_notify after writing its request.  The callback drains all
+     * pending requests and sends responses.  The 1-second timeout ensures we
+     * wake up to check SIGTERM even if no requests arrive.
      */
+    wctx.server        = &server;
+    wctx.handle_fn     = handle_fn;
+    wctx.resp_buf      = resp_buf;
+    wctx.resp_buf_size = sizeof(resp_buf);
+
+    while (!tdb_got_sigterm)
     {
-    const uint8_t       *req_data;
-    c_size_t             req_elems;
-    uint8_t              opcode;
-    const uint8_t       *payload;
-    uint32_t             payload_len;
-    uint8_t              status;
-    c_size_t             total_resp;
-    iox2_response_mut_h  response;
-    uint8_t             *resp_payload;
-    bool                 had_work;
-
-    while (true)
-    {
-        had_work = false;
-
-        /* Drain all pending requests without sleeping. */
-        while (true)
-        {
-            active_req = NULL;
-            ret = iox2_server_receive(&server, NULL, &active_req);
-            if (ret != IOX2_OK || active_req == NULL)
-                break;
-
-            /* Extract opcode + payload from request slice. */
-            req_data  = NULL;
-            req_elems = 0;
-            iox2_active_request_payload(&active_req,
-                                        (const void **) &req_data, &req_elems);
-
-            if (req_elems < 1)
-            {
-                iox2_active_request_drop(active_req);
-                continue;
-            }
-
-            opcode      = req_data[0];
-            payload     = req_data + 1;
-            payload_len = (uint32_t)(req_elems - 1);
-
-            /* Dispatch to Go. */
-            resp_len = 0;
-            status = handle_fn(opcode, payload, payload_len,
-                               resp_buf, sizeof(resp_buf), &resp_len);
-
-            /* Send response: [status byte] + [resp_buf[:resp_len]]. */
-            total_resp   = (c_size_t)(1 + resp_len);
-            response     = NULL;
-            resp_payload = NULL;
-            ret = iox2_active_request_loan_slice_uninit(
-                    &active_req, NULL, &response, total_resp);
-            if (ret != IOX2_OK)
-            {
-                ereport(WARNING,
-                        (errmsg("treedb: loan response slice failed: %d", ret)));
-                iox2_active_request_drop(active_req);
-                continue;
-            }
-
-            iox2_response_mut_payload_mut(&response,
-                                          (void **) &resp_payload, NULL);
-            resp_payload[0] = status;
-            if (resp_len > 0)
-                memcpy(resp_payload + 1, resp_buf, resp_len);
-
-            iox2_response_mut_send(response);
-            iox2_active_request_drop(active_req);
-            had_work = true;
-        }
-
-        /* Check for SIGTERM (PostgreSQL shutdown). */
-        if (tdb_got_sigterm)
-            break;
-
-        /* Yield to OS when idle — sched_yield() is much shorter than usleep() on macOS. */
-        if (!had_work)
-            sched_yield();
-    }
+        ws_result = (iox2_waitset_run_result_e) 0;
+        ret = iox2_waitset_wait_and_process_once_with_timeout(
+                &waitset, tdb_process_requests_cb, &wctx,
+                1 /* seconds */, 0 /* nanoseconds */, &ws_result);
+        if (ret != IOX2_OK)
+            ereport(WARNING,
+                    (errmsg("treedb: waitset error %d (result %d); continuing",
+                            ret, (int) ws_result)));
     }
 
     /* Cleanup */
+    iox2_waitset_guard_drop(guard);
+    iox2_waitset_drop(waitset);
+    iox2_listener_drop(listener);
     iox2_server_drop(server);
     iox2_node_drop(node_handle);
     dlclose(shim_handle);

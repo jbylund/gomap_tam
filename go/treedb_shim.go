@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"sync"
@@ -476,6 +478,11 @@ func treedb_init(dbPathC *C.char) C.int32_t {
 		os.Stderr.WriteString("treedb_init: mkdir failed: " + err.Error() + "\n")
 		return C.int32_t(-1)
 	}
+	go func() {
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			os.Stderr.WriteString("treedb pprof: " + err.Error() + "\n")
+		}
+	}()
 	return C.int32_t(0)
 }
 
