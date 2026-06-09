@@ -24,8 +24,19 @@
 #define TDB_OP_TRUNCATE    0x07
 #define TDB_OP_COUNT       0x08
 #define TDB_OP_UPDATE        0x09
-#define TDB_OP_INSERT_KEYED  0x0A  /* insert at caller-supplied key */
-#define TDB_OP_REKEY         0x0B  /* rename old_key → new_key (used during PK index build) */
+#define TDB_OP_INSERT_KEYED     0x0A  /* insert at caller-supplied key */
+#define TDB_OP_REKEY            0x0B  /* rename old_key → new_key (used during PK index build) */
+#define TDB_OP_SCAN_NEXT_BATCH  0x0C  /* fetch up to N rows in one RPC */
+
+/*
+ * Maximum bytes of row data returned per SCAN_NEXT_BATCH response.
+ * The server fills rows greedily until the next row would overflow this limit.
+ * Tune this constant and recompile to benchmark different batch sizes.
+ * (Only treedb_pgext needs recompiling — the Go shim reads max_bytes from the request.)
+ */
+#define TDB_SCAN_BATCH_BUF  (64 * 1024)
+/* Receive buffer on the client side. Must be >= TDB_SCAN_BATCH_BUF + 32. */
+#define TDB_SCAN_RESP_BUF   (TDB_SCAN_BATCH_BUF + 32)
 
 #define TDB_STATUS_OK        0x00
 #define TDB_STATUS_NOT_FOUND 0x01
@@ -309,6 +320,103 @@ tdb_rpc(uint8 opcode,
     {
         if (resp_out)     *resp_out     = NULL;
         if (resp_len_out) *resp_len_out = 0;
+    }
+
+    iox2_response_drop(response);
+    return status;
+}
+
+/*
+ * tdb_rpc_into — like tdb_rpc but writes response bytes directly into
+ * a caller-provided buffer instead of palloc'ing.  Used by the batch
+ * scan path to avoid an extra allocation and copy per batch.
+ *
+ * Returns the status byte.  *resp_len_out receives the number of bytes
+ * written.  Raises ereport(ERROR) on transport error or TDB_STATUS_ERROR.
+ */
+static inline uint8
+tdb_rpc_into(uint8 opcode,
+             const void *req, uint32 req_len,
+             void *resp_buf, uint32 resp_buf_size, uint32 *resp_len_out)
+{
+    iox2_client_h          *client      = tdb_get_client();
+    iox2_request_mut_h      request     = NULL;
+    iox2_pending_response_h pending     = NULL;
+    iox2_response_h         response    = NULL;
+    uint8_t                *req_payload = NULL;
+    c_size_t                total_req   = (c_size_t)(1 + req_len);
+    const uint8_t          *resp_data   = NULL;
+    c_size_t                resp_elems  = 0;
+    uint8                   status;
+    uint32                  rlen;
+    int                     ret;
+    int                     spin;
+
+    ret = iox2_client_loan_slice_uninit(client, NULL, &request, total_req);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: loan request slice failed: %d", ret)));
+
+    iox2_request_mut_payload_mut(&request, (void **) &req_payload, NULL);
+    req_payload[0] = opcode;
+    if (req_len > 0)
+        memcpy(req_payload + 1, req, (size_t) req_len);
+
+    ret = iox2_request_mut_send(request, NULL, &pending);
+    if (ret != IOX2_OK)
+        ereport(ERROR, (errmsg("treedb: send request failed: %d", ret)));
+
+    iox2_notifier_notify(&tdb_iox2_notifier, NULL);
+
+    for (spin = 0; spin < TDB_SPIN_ITERS; spin++)
+    {
+        response = NULL;
+        ret = iox2_pending_response_receive(&pending, NULL, &response);
+        if (ret != IOX2_OK)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR, (errmsg("treedb: pending_response_receive failed: %d", ret)));
+        }
+        if (response != NULL) break;
+        TDB_CPU_PAUSE();
+    }
+    while (response == NULL)
+    {
+        ret = iox2_pending_response_receive(&pending, NULL, &response);
+        if (ret != IOX2_OK)
+        {
+            iox2_pending_response_drop(pending);
+            ereport(ERROR, (errmsg("treedb: pending_response_receive failed: %d", ret)));
+        }
+        if (response != NULL) break;
+        sched_yield();
+    }
+
+    iox2_pending_response_drop(pending);
+
+    iox2_response_payload(&response, (const void **) &resp_data, &resp_elems);
+
+    status = (resp_elems >= 1) ? resp_data[0] : TDB_STATUS_ERROR;
+    rlen   = (resp_elems > 1)  ? (uint32)(resp_elems - 1) : 0;
+
+    if (status == TDB_STATUS_ERROR)
+    {
+        char errmsg_buf[256] = "unknown error from background worker";
+        if (rlen > 0)
+        {
+            uint32 msglen = rlen < sizeof(errmsg_buf) - 1
+                            ? rlen : (uint32)(sizeof(errmsg_buf) - 1);
+            memcpy(errmsg_buf, resp_data + 1, msglen);
+            errmsg_buf[msglen] = '\0';
+        }
+        iox2_response_drop(response);
+        ereport(ERROR, (errmsg("treedb: %s", errmsg_buf)));
+    }
+
+    if (resp_len_out) *resp_len_out = 0;
+    if (rlen > 0 && resp_buf != NULL && resp_buf_size >= rlen)
+    {
+        memcpy(resp_buf, resp_data + 1, rlen);
+        if (resp_len_out) *resp_len_out = rlen;
     }
 
     iox2_response_drop(response);

@@ -37,8 +37,10 @@ PGDLLEXPORT void treedb_bgworker_main(Datum main_arg);
 #error "TDB_SHIM_PATH must be defined at compile time (path to treedb_shim.so)"
 #endif
 
-/* Maximum response payload from a single Go call (8 KB for one tuple + 32 bytes overhead). */
-#define TDB_MAX_RESP_PAYLOAD  (8 * 1024 + 32)
+/* Maximum response payload from a single Go call.
+ * Must be >= TDB_SCAN_RESP_BUF so SCAN_NEXT_BATCH can transmit a full batch.
+ * Single-tuple responses are much smaller; iceoryx2 only sends what's needed. */
+#define TDB_MAX_RESP_PAYLOAD  TDB_SCAN_RESP_BUF
 /* Maximum iceoryx2 request slice: 1 byte opcode + up to 8 KB tuple payload. */
 #define TDB_MAX_REQ_SLICE     (8 * 1024 + 32)
 /* Maximum iceoryx2 response slice: 1 byte status + TDB_MAX_RESP_PAYLOAD. */
@@ -307,7 +309,7 @@ treedb_bgworker_main(Datum main_arg)
     tdb_bgworker_ctx_t       wctx;
     iox2_waitset_run_result_e ws_result;
 
-    /* Response scratch buffer (allocated on stack — 8 KB + overhead). */
+    /* Response scratch buffer. Large enough for a full SCAN_NEXT_BATCH batch. */
     uint8_t  resp_buf[TDB_MAX_RESP_PAYLOAD];
 
     int ret;

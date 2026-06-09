@@ -31,8 +31,9 @@ const (
 	opTruncate    = 0x07
 	opCount       = 0x08
 	opUpdate      = 0x09
-	opInsertKeyed = 0x0A
-	opRekey       = 0x0B
+	opInsertKeyed    = 0x0A
+	opRekey          = 0x0B
+	opScanNextBatch  = 0x0C
 )
 
 const (
@@ -411,6 +412,63 @@ func handleRekey(payload []byte) (byte, []byte) {
 	return statusOK, nil
 }
 
+func handleScanNextBatch(payload []byte) (byte, []byte) {
+	if len(payload) < 12 {
+		return statusError, []byte("scan_next_batch: payload too short")
+	}
+	scanID := binary.BigEndian.Uint64(payload[0:8])
+	maxBytes := binary.BigEndian.Uint32(payload[8:12])
+
+	scansMu.Lock()
+	state, ok := scans[scanID]
+	scansMu.Unlock()
+	if !ok {
+		return statusError, []byte("scan_next_batch: unknown scan id")
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Response wire format: [num_rows u32][seqnum u64][len u32][data...] × N
+	const rowHdr = 12 // seqnum(8) + len(4)
+	buf := make([]byte, 4, int(maxBytes)+rowHdr)
+	var nrows uint32
+
+	for state.iter.Valid() {
+		key := state.iter.Key()
+		val := state.iter.Value()
+
+		if len(key) < 8 {
+			state.iter.Next()
+			continue
+		}
+		if len(val) == 0 {
+			state.iter.Next() // tombstone
+			continue
+		}
+
+		// Stop if adding this row would exceed maxBytes (always add at least one).
+		if nrows > 0 && uint32(len(buf)+rowHdr+len(val)) > maxBytes+4 {
+			break
+		}
+
+		seqNum := binary.BigEndian.Uint64(key[0:8])
+		hdr := [rowHdr]byte{}
+		binary.BigEndian.PutUint64(hdr[0:8], seqNum)
+		binary.BigEndian.PutUint32(hdr[8:12], uint32(len(val)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, val...)
+		nrows++
+		state.iter.Next()
+	}
+
+	if nrows == 0 {
+		return statusNotFound, nil
+	}
+	binary.BigEndian.PutUint32(buf[0:4], nrows)
+	return statusOK, buf
+}
+
 func handleTruncate(payload []byte) (byte, []byte) {
 	if len(payload) < 4 {
 		return statusError, []byte("truncate: payload too short")
@@ -463,6 +521,8 @@ func dispatch(opcode byte, payload []byte) (byte, []byte) {
 		return handleInsertKeyed(payload)
 	case opRekey:
 		return handleRekey(payload)
+	case opScanNextBatch:
+		return handleScanNextBatch(payload)
 	default:
 		return statusError, []byte("unknown opcode")
 	}

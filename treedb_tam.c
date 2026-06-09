@@ -32,9 +32,13 @@ Datum treedb_am_handler(PG_FUNCTION_ARGS);
  * ---------------------------------------------------------------- */
 typedef struct TDBScanDesc
 {
-    TableScanDescData   rs_base;    /* must be first */
-    uint64              scan_id;    /* scan ID assigned by the background worker */
-    bool                scan_done;  /* true once SCAN_NEXT returned NOT_FOUND */
+    TableScanDescData   rs_base;        /* must be first */
+    uint64              scan_id;        /* scan ID assigned by the background worker */
+    bool                scan_done;      /* true once SCAN_NEXT_BATCH returned NOT_FOUND */
+    /* Batch prefetch state */
+    uint8              *batch_buf;      /* palloc'd, TDB_SCAN_RESP_BUF bytes */
+    uint32              batch_nrows;    /* rows remaining in buffer */
+    uint32              batch_pos;      /* byte offset of next row in batch_buf */
 } TDBScanDesc;
 
 /* ----------------------------------------------------------------
@@ -106,52 +110,64 @@ tdb_scan_begin_rpc(RelFileNumber relnum)
 }
 
 /*
- * Fetch the next tuple for scan_id.
+ * Fetch the next tuple from a scan, using batch prefetch.
+ *
+ * When the local prefetch buffer is empty, issues a SCAN_NEXT_BATCH RPC
+ * to refill it with up to TDB_SCAN_BATCH_BUF bytes of rows.  Subsequent
+ * calls drain the buffer without any IPC until it empties again.
+ *
+ * Batch response layout: [num_rows(4)][seq(8) len(4) data...] × N
+ *
  * Returns true if a tuple was placed in slot, false if scan is exhausted.
  */
 static bool
-tdb_scan_next_rpc(uint64 scan_id, Oid tableOid, TupleTableSlot *slot)
+tdb_scan_next_batch(TDBScanDesc *scan, Oid tableOid, TupleTableSlot *slot)
 {
-    uint8   req[8];
-    void   *resp    = NULL;
-    uint32  resp_len;
-    uint8   status;
+    uint8           req[12];
+    uint32          resp_len;
+    uint8           status;
+    uint32          nrows;
+    uint64          seq_num;
+    uint32          tuple_len;
     ItemPointerData tid;
-    HeapTuple tuple;
+    HeapTuple       tuple;
+    uint8          *p;
 
-    tdb_put_u64(req, scan_id);
-    status = tdb_rpc(TDB_OP_SCAN_NEXT, req, 8, &resp, &resp_len);
-
-    if (status == TDB_STATUS_NOT_FOUND)
+    /* Refill when buffer is drained. */
+    if (scan->batch_nrows == 0)
     {
-        if (resp) pfree(resp);
-        return false;
+        tdb_put_u64(req, scan->scan_id);
+        tdb_put_u32(req + 8, (uint32) TDB_SCAN_BATCH_BUF);
+        status = tdb_rpc_into(TDB_OP_SCAN_NEXT_BATCH, req, 12,
+                              scan->batch_buf, TDB_SCAN_RESP_BUF, &resp_len);
+
+        if (status == TDB_STATUS_NOT_FOUND)
+            return false;
+
+        if (resp_len < 4)
+            ereport(ERROR, (errmsg("treedb: malformed SCAN_NEXT_BATCH response")));
+
+        nrows = tdb_get_u32(scan->batch_buf);
+        if (nrows == 0)
+            return false;
+
+        scan->batch_nrows = nrows;
+        scan->batch_pos   = 4; /* skip the leading num_rows field */
     }
 
-    /* Response layout: [8-byte seq_num][4-byte tuple_len][tuple_data] */
-    if (!resp || resp_len < 12)
-    {
-        if (resp) pfree(resp);
-        ereport(ERROR, (errmsg("treedb: malformed SCAN_NEXT response")));
-    }
-
-    {
-    uint64  seq_num   = tdb_get_u64((uint8 *) resp);
-    uint32  tuple_len = tdb_get_u32((uint8 *) resp + 8);
-
-    if (resp_len < 12 + tuple_len)
-    {
-        pfree(resp);
-        ereport(ERROR, (errmsg("treedb: truncated tuple in SCAN_NEXT")));
-    }
+    /* Consume one row from the buffer. */
+    p         = scan->batch_buf + scan->batch_pos;
+    seq_num   = tdb_get_u64(p);      p += 8;
+    tuple_len = tdb_get_u32(p);      p += 4;
 
     tdb_seq_to_ctid(seq_num, &tid);
-    tuple = tdb_make_tuple(tableOid, &tid, (char *) resp + 12, tuple_len);
-    pfree(resp);
+    tuple = tdb_make_tuple(tableOid, &tid, (char *) p, tuple_len);
 
-    ExecStoreHeapTuple(tuple, slot, true /* pfree on next store */);
+    scan->batch_pos   = (uint32)(p + tuple_len - scan->batch_buf);
+    scan->batch_nrows--;
+
+    ExecStoreHeapTuple(tuple, slot, true);
     return true;
-    } /* end inner block for seq_num/tuple_len */
 }
 
 static void
@@ -285,6 +301,9 @@ treedb_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
     scan->rs_base.rs_nkeys    = nkeys;
     scan->rs_base.rs_flags    = flags;
     scan->scan_done           = false;
+    scan->batch_buf           = (uint8 *) palloc(TDB_SCAN_RESP_BUF);
+    scan->batch_nrows         = 0;
+    scan->batch_pos           = 0;
     scan->scan_id             = tdb_scan_begin_rpc(rel->rd_locator.relNumber);
 
     return (TableScanDesc) scan;
@@ -315,8 +334,10 @@ treedb_scan_rescan(TableScanDesc sscan, struct ScanKeyData *key,
     if (!scan->scan_done)
         tdb_scan_end_rpc(scan->scan_id);
 
-    scan->scan_done = false;
-    scan->scan_id   = tdb_scan_begin_rpc(sscan->rs_rd->rd_locator.relNumber);
+    scan->scan_done   = false;
+    scan->batch_nrows = 0;
+    scan->batch_pos   = 0;
+    scan->scan_id     = tdb_scan_begin_rpc(sscan->rs_rd->rd_locator.relNumber);
 }
 
 static bool
@@ -336,9 +357,7 @@ treedb_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
     if (direction == BackwardScanDirection)
         ereport(ERROR, (errmsg("treedb: backward scan not supported in Phase 0")));
 
-    found = tdb_scan_next_rpc(scan->scan_id,
-                                   sscan->rs_rd->rd_id,
-                                   slot);
+    found = tdb_scan_next_batch(scan, sscan->rs_rd->rd_id, slot);
     if (!found)
     {
         scan->scan_done = true;
